@@ -1,11 +1,14 @@
 import Database from 'better-sqlite3';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export const DB_PATH = join(__dirname, '..', 'data', 'easel.db');
+
+// Ensure data directory exists
+mkdirSync(join(__dirname, '..', 'data'), { recursive: true });
 
 export const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');

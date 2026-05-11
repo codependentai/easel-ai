@@ -53,6 +53,8 @@ npm run dev
 
 Then open <http://localhost:5178>.
 
+> Note: Ensure that `.env` is filled in and that `dotenv` is installed by running `npm install` before starting. The app also creates and uses `data/easel.db`, so the `data/` directory must be writable.
+
 ## Configuration
 
 All config is via environment variables. See [`.env.example`](./.env.example) for the full list.
