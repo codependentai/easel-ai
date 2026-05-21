@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'image_generation', -- image_generation | remix | edit
   prompt TEXT NOT NULL,
+  composed_prompt TEXT,
   preset_id TEXT,
   parent_task_id TEXT,
   aspect_ratio TEXT NOT NULL,

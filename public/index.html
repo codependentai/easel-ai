@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Easel</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -47,8 +48,31 @@
     <main class="main">
       <header class="main-header">
         <h1 id="view-title">My media</h1>
-        <div class="main-header-meta" id="view-meta"></div>
+        <div class="main-header-actions">
+          <div class="main-header-meta" id="view-meta"></div>
+          <button class="header-icon-btn" id="activity-btn" type="button" title="Generation activity" data-icon="clock"></button>
+        </div>
       </header>
+
+      <div class="gallery-tools" id="gallery-tools" hidden>
+        <button class="tool-btn" id="select-mode-btn" type="button" data-icon="check-square">Select</button>
+        <div class="gallery-search">
+          <span class="gallery-search-icon" data-icon="search"></span>
+          <input id="gallery-search-input" type="search" placeholder="Search prompts, presets, dates..." autocomplete="off" />
+          <button id="gallery-search-clear" type="button" title="Clear search" data-icon="x" hidden></button>
+        </div>
+      </div>
+
+      <div class="selection-bar" id="selection-bar" hidden>
+        <span id="selection-count">0 selected</span>
+        <div class="selection-actions">
+          <button type="button" class="btn-ghost btn btn-with-icon" data-batch-action="favorite" data-icon="star">Favorite</button>
+          <button type="button" class="btn-ghost btn btn-with-icon" data-batch-action="move" data-icon="folder">Move</button>
+          <button type="button" class="btn-ghost btn btn-with-icon" data-batch-action="export" data-icon="download">Export</button>
+          <button type="button" class="btn-danger btn btn-with-icon" data-batch-action="trash" data-icon="trash">Trash</button>
+          <button type="button" class="btn-ghost btn btn-with-icon" data-batch-action="clear" data-icon="x">Clear</button>
+        </div>
+      </div>
 
       <section id="view-root" class="view-root"></section>
     </main>
@@ -85,6 +109,9 @@
         </button>
         <button type="button" class="chip chip-picker" id="chip-style">
           <span class="chip-icon" data-icon="palette"></span><span class="chip-value">No style</span>
+        </button>
+        <button type="button" class="chip chip-picker" id="chip-review">
+          <span class="chip-icon" data-icon="eye"></span><span class="chip-value">Review</span>
         </button>
       </div>
     </form>

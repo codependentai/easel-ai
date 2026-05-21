@@ -1,11 +1,13 @@
 import Database from 'better-sqlite3';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export const DB_PATH = join(__dirname, '..', 'data', 'easel.db');
+
+mkdirSync(dirname(DB_PATH), { recursive: true });
 
 export const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -21,6 +23,9 @@ function columnExists(table: string, column: string): boolean {
 }
 if (!columnExists('presets', 'type')) {
   db.exec(`ALTER TABLE presets ADD COLUMN type TEXT NOT NULL DEFAULT 'character'`);
+}
+if (!columnExists('tasks', 'composed_prompt')) {
+  db.exec(`ALTER TABLE tasks ADD COLUMN composed_prompt TEXT`);
 }
 
 export type PresetType = 'character' | 'style';
@@ -49,6 +54,7 @@ export type Task = {
   id: string;
   kind: string;
   prompt: string;
+  composed_prompt: string | null;
   preset_id: string | null;
   parent_task_id: string | null;
   aspect_ratio: string;

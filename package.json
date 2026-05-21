@@ -1,6 +1,6 @@
 {
   "name": "easel-ai",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local-first, BYOK image gallery with character/style presets and an AI prompt workshop. A self-hosted replacement for Sora's 'my media' after the April 2026 shutdown.",
   "license": "Apache-2.0",
   "author": "Codependent AI",

@@ -21,6 +21,9 @@ const state = {
   tasks: [],
   presets: [],
   folders: [],
+  search: '',
+  selectMode: false,
+  selectedTaskIds: new Set(),
   settings: {
     aspect: '2:3',
     variants: 2,
@@ -34,6 +37,14 @@ const state = {
 const ASPECTS = ['1:1', '3:2', '2:3', '16:9', '9:16'];
 const VARIANTS = [1, 2, 3, 4];
 const QUALITIES = ['low', 'medium', 'high'];
+const SETTINGS_KEY = 'easel:settings';
+const BEST_VARIANTS_KEY = 'easel:best-variants';
+const DRAFTS_KEY = 'easel:prompt-drafts';
+const SKETCHPAD_KEY = 'easel:sketchpad';
+
+state.bestVariants = loadJson(BEST_VARIANTS_KEY, {});
+state.presetSearch = '';
+state.presetTypeFilter = 'all';
 
 // ---- API ----
 async function api(path, opts = {}) {
@@ -50,12 +61,29 @@ async function api(path, opts = {}) {
 }
 
 // ---- Toast ----
-function toast(message, kind = 'ok') {
+function toast(message, kind = 'ok', action = null) {
+  if (typeof kind === 'object' && kind) {
+    action = kind;
+    kind = 'ok';
+  }
   const el = document.createElement('div');
   el.className = 'toast' + (kind === 'err' ? ' err' : '');
-  el.textContent = message;
+  el.innerHTML = `<span>${escapeHtml(message)}</span>`;
+  if (action?.label && typeof action.onClick === 'function') {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = action.label;
+    btn.addEventListener('click', async () => {
+      try {
+        await action.onClick();
+      } finally {
+        el.remove();
+      }
+    });
+    el.appendChild(btn);
+  }
   $('#toast-root').appendChild(el);
-  setTimeout(() => el.remove(), 3600);
+  setTimeout(() => el.remove(), action ? 7000 : 3600);
 }
 
 // ---- Popover ----
@@ -215,10 +243,607 @@ function formatTime(d) {
   return new Date(d).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }).toLowerCase();
 }
 
+function searchableTaskText(task) {
+  const presetText = (task.presets ?? [])
+    .map((p) => `${p.name} v${p.version} ${p.type}`)
+    .join(' ');
+  const dateText = new Date(task.created_at).toLocaleString();
+  return [
+    task.prompt,
+    task.kind,
+    task.aspect_ratio,
+    task.quality,
+    task.status,
+    presetText,
+    dateText,
+    task.reference_image_path ? 'reference ref' : '',
+    task.favorite ? 'favorite starred' : '',
+    task.trashed ? 'trash trashed' : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
+function filteredTasks() {
+  const q = state.search.trim().toLowerCase();
+  if (!q) return state.tasks;
+  const terms = q.split(/\s+/).filter(Boolean);
+  return state.tasks.filter((task) => {
+    const haystack = searchableTaskText(task);
+    return terms.every((term) => haystack.includes(term));
+  });
+}
+
+function isGalleryView() {
+  return ['media', 'favorites', 'trash', 'folder'].includes(state.view);
+}
+
+function taskById(taskId) {
+  return state.tasks.find((t) => t.id === taskId);
+}
+
+function selectedIds() {
+  return [...state.selectedTaskIds].filter((id) => taskById(id));
+}
+
+function setSelectMode(enabled) {
+  state.selectMode = enabled;
+  if (!enabled) state.selectedTaskIds.clear();
+  renderGallery();
+  updateSelectionBar();
+}
+
+function toggleTaskSelection(taskId) {
+  if (state.selectedTaskIds.has(taskId)) state.selectedTaskIds.delete(taskId);
+  else state.selectedTaskIds.add(taskId);
+  updateSelectionBar();
+  const selected = state.selectedTaskIds.has(taskId);
+  const card = document.querySelector(`.task-card[data-task-id="${taskId}"]`);
+  card?.classList.toggle('selected', selected);
+  const btn = card?.querySelector('.task-select');
+  if (btn) {
+    btn.classList.toggle('active', selected);
+    btn.innerHTML = icon(selected ? 'check-square' : 'square', { size: 14 });
+  }
+}
+
+function updateSelectionBar() {
+  const bar = $('#selection-bar');
+  if (!bar) return;
+  const count = selectedIds().length;
+  bar.hidden = !state.selectMode && count === 0;
+  $('#selection-count').textContent = count === 1 ? '1 selected' : `${count} selected`;
+  $('#select-mode-btn')?.classList.toggle('active', state.selectMode);
+}
+
+function selectedPresetStack() {
+  const chars = state.settings.characterIds
+    .map((id) => state.presets.find((p) => p.id === id))
+    .filter(Boolean);
+  const style = state.presets.find((p) => p.id === state.settings.styleId);
+  return { chars, style };
+}
+
+function loadSettings() {
+  const saved = loadJson(SETTINGS_KEY, null);
+  if (!saved) return;
+  state.settings.aspect = ASPECTS.includes(saved.aspect) ? saved.aspect : state.settings.aspect;
+  state.settings.variants = VARIANTS.includes(saved.variants) ? saved.variants : state.settings.variants;
+  state.settings.quality = QUALITIES.includes(saved.quality) ? saved.quality : state.settings.quality;
+  const presetIds = new Set(state.presets.map((p) => p.id));
+  state.settings.characterIds = Array.isArray(saved.characterIds)
+    ? saved.characterIds.filter((id) => presetIds.has(id))
+    : [];
+  state.settings.styleId = presetIds.has(saved.styleId) ? saved.styleId : '';
+}
+
+function saveSettings() {
+  localStorage.setItem(
+    SETTINGS_KEY,
+    JSON.stringify({
+      aspect: state.settings.aspect,
+      variants: state.settings.variants,
+      quality: state.settings.quality,
+      characterIds: state.settings.characterIds,
+      styleId: state.settings.styleId,
+    }),
+  );
+}
+
+function composedPrompt(promptText = $('#prompt-input')?.value?.trim() ?? '') {
+  const { chars, style } = selectedPresetStack();
+  return [
+    ...chars.map((p) => p.body.trim()),
+    ...(style ? [style.body.trim()] : []),
+    promptText.trim(),
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function taskRecipe(task) {
+  return task.composed_prompt || task.prompt || '';
+}
+
+async function copyText(text, label = 'Copied') {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(label);
+  } catch (e) {
+    toast('Copy failed: ' + e.message, 'err');
+  }
+}
+
+function applyTaskToComposer(task, { prompt = task.prompt, referencePath = task.reference_image_path } = {}) {
+  $('#prompt-input').value = prompt ?? '';
+  state.settings.aspect = task.aspect_ratio;
+  state.settings.variants = task.variant_count;
+  state.settings.quality = task.quality;
+  state.settings.characterIds = (task.presets ?? []).filter((p) => p.type === 'character').map((p) => p.id);
+  state.settings.styleId = (task.presets ?? []).find((p) => p.type === 'style')?.id ?? '';
+  state.settings.referencePath = referencePath ?? null;
+  syncChips();
+  renderRefStrip();
+  autoResizePrompt();
+}
+
+async function reuseTask(task) {
+  applyTaskToComposer(task);
+  await goto('media');
+  $('#prompt-input').focus();
+  toast('Prompt and settings loaded');
+}
+
+async function remixTask(task) {
+  try {
+    const first = task.variants?.[0];
+    if (!first) throw new Error('No variant available to remix');
+    const resp = await fetch(`/images/${first.image_path}`);
+    if (!resp.ok) throw new Error('Could not load source image');
+    const blob = await resp.blob();
+    const file = new File([blob], 'remix.png', { type: blob.type || 'image/png' });
+    const up = await uploadFile(file);
+    applyTaskToComposer(task, { prompt: '', referencePath: up.path });
+    await goto('media');
+    $('#prompt-input').focus();
+    toast('Remix reference attached');
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+function downloadFirstVariant(task) {
+  const first = task.variants?.[0];
+  if (!first) return toast('No image to download', 'err');
+  const a = document.createElement('a');
+  a.href = `/images/${first.image_path}`;
+  a.download = `${task.id}-0.png`;
+  a.click();
+}
+
+async function exportTasks(taskIds) {
+  const tasks = taskIds
+    .map((id) => taskById(id))
+    .filter(Boolean);
+  if (tasks.length === 0) return toast('Select at least one generation', 'err');
+
+  const resp = await fetch('/api/export', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ task_ids: tasks.map((task) => task.id) }),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ error: resp.statusText }));
+    throw new Error(err.error || 'Export failed');
+  }
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `easel-ai-export-${new Date().toISOString().slice(0, 10)}.zip`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast(tasks.length === 1 ? 'Exported archive' : `Exported ${tasks.length} generations`);
+}
+
+async function moveTasksToFolder(taskIds, folderId) {
+  const previous = taskIds.map((id) => ({ id, folder_id: taskById(id)?.folder_id ?? null }));
+  await Promise.all(
+    taskIds.map((id) => api(`/api/tasks/${id}`, { method: 'PATCH', body: { folder_id: folderId } })),
+  );
+  const folderName = folderId
+    ? state.folders.find((f) => f.id === folderId)?.name || 'folder'
+    : 'No folder';
+  toast(`${taskIds.length === 1 ? 'Moved' : `Moved ${taskIds.length}`} to ${folderName}`, {
+    label: 'Undo',
+    onClick: async () => {
+      await Promise.all(
+        previous.map((item) =>
+          api(`/api/tasks/${item.id}`, { method: 'PATCH', body: { folder_id: item.folder_id } }),
+        ),
+      );
+      await refreshView();
+      setViewTitle();
+      toast('Move undone');
+    },
+  });
+  state.selectedTaskIds.clear();
+  state.selectMode = false;
+  await refreshView();
+  setViewTitle();
+}
+
+async function setTasksTrashed(taskIds, trashed) {
+  const previous = taskIds.map((id) => ({ id, trashed: !!taskById(id)?.trashed }));
+  await Promise.all(
+    taskIds.map((id) => api(`/api/tasks/${id}`, { method: 'PATCH', body: { trashed } })),
+  );
+  state.selectedTaskIds.clear();
+  state.selectMode = false;
+  toast(
+    trashed
+      ? taskIds.length === 1
+        ? 'Moved to trash'
+        : `Moved ${taskIds.length} to trash`
+      : taskIds.length === 1
+        ? 'Restored'
+        : `Restored ${taskIds.length}`,
+    trashed
+      ? {
+          label: 'Undo',
+          onClick: async () => {
+            await Promise.all(
+              previous.map((item) =>
+                api(`/api/tasks/${item.id}`, { method: 'PATCH', body: { trashed: item.trashed } }),
+              ),
+            );
+            await refreshView();
+            setViewTitle();
+            toast('Trash undone');
+          },
+        }
+      : null,
+  );
+  await refreshView();
+  setViewTitle();
+}
+
+function openNewFolderDialog({ onCreated } = {}) {
+  const panel = modal(
+    'New folder',
+    `
+      <form id="new-folder-form" class="folder-form">
+        <label>
+          <span class="input-label">Folder name</span>
+          <input class="text-input" id="new-folder-name" type="text" placeholder="e.g. Campaign references" autocomplete="off" />
+        </label>
+        <div class="folder-form-error" id="new-folder-error" hidden></div>
+      </form>
+    `,
+    `
+      <button type="button" class="btn-ghost btn" id="cancel-new-folder">Cancel</button>
+      <button type="submit" form="new-folder-form" class="btn btn-with-icon">${icon('folder-plus', { size: 14 })} Create folder</button>
+    `,
+  );
+  const form = panel.querySelector('#new-folder-form');
+  const input = panel.querySelector('#new-folder-name');
+  const error = panel.querySelector('#new-folder-error');
+  const submit = panel.querySelector('button[type="submit"]');
+  panel.querySelector('#cancel-new-folder')?.addEventListener('click', closeModal);
+  setTimeout(() => input.focus(), 0);
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const name = input.value.trim();
+    if (!name) {
+      error.textContent = 'Name the folder first.';
+      error.hidden = false;
+      input.focus();
+      return;
+    }
+    submit.disabled = true;
+    submit.innerHTML = `${icon('clock', { size: 14 })} Creating...`;
+    try {
+      const folder = await api('/api/folders', { method: 'POST', body: { name } });
+      await loadFolders();
+      closeModal();
+      toast(`Created ${folder.name}`);
+      if (onCreated) await onCreated(folder);
+    } catch (e) {
+      error.textContent = e.message;
+      error.hidden = false;
+      submit.disabled = false;
+      submit.innerHTML = `${icon('folder-plus', { size: 14 })} Create folder`;
+    }
+  });
+}
+
+function openMoveMenu(anchor, taskIds) {
+  const firstTask = taskById(taskIds[0]);
+  const options = [
+    { value: '', label: 'No folder', active: taskIds.length === 1 && !firstTask?.folder_id },
+    ...state.folders.map((f) => ({
+      value: f.id,
+      label: f.name,
+      active: taskIds.length === 1 && firstTask?.folder_id === f.id,
+    })),
+    { value: '__new', label: '+ New folder', active: false },
+  ];
+  popover(anchor, 'Move to folder', options, async (value) => {
+    let folderId = value || null;
+    if (value === '__new') {
+      return openNewFolderDialog({
+        onCreated: async (folder) => moveTasksToFolder(taskIds, folder.id),
+      });
+    }
+    await moveTasksToFolder(taskIds, folderId);
+  });
+}
+
+function openTaskMenu(anchor, task) {
+  const trashed = !!task.trashed;
+  const options = [
+    { value: 'reuse', label: 'Edit prompt', active: false },
+    { value: 'remix', label: 'Remix from image', active: false },
+    { value: 'move', label: 'Add to folder', active: false },
+    { value: 'copy', label: 'Copy prompt', active: false },
+    { value: 'download', label: 'Download first image', active: false },
+    { value: 'favorite', label: task.favorite ? 'Unfavorite' : 'Favorite', active: !!task.favorite },
+    { value: trashed ? 'restore' : 'trash', label: trashed ? 'Restore' : 'Move to trash', active: false },
+  ];
+  popover(anchor, 'Actions', options, async (action) => {
+    if (action === 'reuse') return reuseTask(task);
+    if (action === 'remix') return remixTask(task);
+    if (action === 'move') return setTimeout(() => openMoveMenu(anchor, [task.id]), 0);
+    if (action === 'copy') return copyText(task.prompt, 'Prompt copied');
+    if (action === 'download') return downloadFirstVariant(task);
+    if (action === 'favorite') {
+      await api(`/api/tasks/${task.id}`, { method: 'PATCH', body: { favorite: !task.favorite } });
+      return refreshView();
+    }
+    if (action === 'trash' || action === 'restore') {
+      return setTasksTrashed([task.id], action === 'trash');
+    }
+  });
+}
+
+function closeModal() {
+  document.getElementById('active-modal')?.remove();
+}
+
+function modal(title, bodyHtml, footerHtml = '') {
+  closeModal();
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  backdrop.id = 'active-modal';
+  backdrop.addEventListener('click', closeModal);
+  const panel = document.createElement('div');
+  panel.className = 'modal-panel';
+  panel.addEventListener('click', (e) => e.stopPropagation());
+  panel.innerHTML = `
+    <div class="modal-header">
+      <div class="modal-title">${escapeHtml(title)}</div>
+      <button class="modal-close" type="button" title="Close">${icon('x', { size: 15 })}</button>
+    </div>
+    <div class="modal-body">${bodyHtml}</div>
+    ${footerHtml ? `<div class="modal-footer">${footerHtml}</div>` : ''}`;
+  backdrop.appendChild(panel);
+  document.body.appendChild(backdrop);
+  panel.querySelector('.modal-close').addEventListener('click', closeModal);
+  return panel;
+}
+
+function openPromptReview() {
+  const promptText = $('#prompt-input').value.trim();
+  const { chars, style } = selectedPresetStack();
+  const folderName = state.view === 'folder'
+    ? state.folders.find((f) => f.id === state.folderId)?.name || 'Current folder'
+    : 'My media';
+  const composed = composedPrompt(promptText);
+  const presetTags = [
+    ...chars.map((p) => `<span class="task-preset-tag character">❈ ${escapeHtml(p.name)} v${p.version}</span>`),
+    ...(style ? [`<span class="task-preset-tag style">✦ ${escapeHtml(style.name)} v${style.version}</span>`] : []),
+  ].join('');
+  const refHtml = state.settings.referencePath
+    ? `<div class="review-ref"><img src="/refs/${state.settings.referencePath}" alt="reference" /><span>Direct reference attached</span></div>`
+    : `<span class="review-muted">No direct reference</span>`;
+
+  const panel = modal(
+    'Generation review',
+    `
+      <div class="review-grid">
+        <div><span class="input-label">Destination</span><strong>${escapeHtml(folderName)}</strong></div>
+        <div><span class="input-label">Format</span><strong>${state.settings.aspect} · ${state.settings.variants}v · ${state.settings.quality}</strong></div>
+      </div>
+      <div class="review-section">
+        <span class="input-label">Presets</span>
+        <div class="task-preset-stack">${presetTags || '<span class="review-muted">No presets selected</span>'}</div>
+      </div>
+      <div class="review-section">
+        <span class="input-label">Reference</span>
+        ${refHtml}
+      </div>
+      <div class="review-section">
+        <span class="input-label">Composed prompt</span>
+        <pre class="review-prompt">${escapeHtml(composed || 'Write a prompt in the composer to preview the full request.')}</pre>
+      </div>
+    `,
+    `
+      <button class="btn-ghost btn btn-with-icon" id="copy-composed">${icon('copy', { size: 14 })} Copy composed</button>
+      <button class="btn btn-with-icon" id="create-from-review">${icon('arrow-up', { size: 14 })} Create image</button>
+    `,
+  );
+  panel.querySelector('#copy-composed')?.addEventListener('click', () => copyText(composed, 'Composed prompt copied'));
+  panel.querySelector('#create-from-review')?.addEventListener('click', () => {
+    closeModal();
+    handleGenerate();
+  });
+}
+
+async function openActivityDrawer() {
+  closeModal();
+  let recent = state.tasks;
+  try {
+    recent = await api('/api/tasks?view=all');
+  } catch {
+    recent = state.tasks;
+  }
+  recent = recent.slice(0, 18);
+  const pending = recent.filter((t) => t.status === 'pending').length;
+  const rows = recent.length
+    ? recent
+        .map((t) => {
+          const statusIcon = t.status === 'pending' ? 'clock' : t.status === 'failed' ? 'x' : 'check';
+          const statusLabel = t.status === 'pending' ? 'Preparing' : t.status === 'failed' ? 'Failed' : 'Ready';
+          return `
+            <button class="activity-row" type="button" data-task-id="${t.id}">
+              <span class="activity-status ${t.status}">${icon(statusIcon, { size: 14 })}</span>
+              <span class="activity-main">
+                <span>${escapeHtml(t.prompt || 'Untitled generation')}</span>
+                <small>${statusLabel} · ${formatTime(t.created_at)} · ${t.aspect_ratio} · ${t.variant_count || t.variants?.length || 1}v</small>
+              </span>
+            </button>`;
+        })
+        .join('')
+    : `<div class="activity-empty">No generations loaded in this view yet.</div>`;
+  const panel = modal(
+    'Generation activity',
+    `
+      <div class="activity-summary">
+        <span>${pending ? `${pending} active` : 'No active generations'}</span>
+        <button class="btn-ghost btn btn-with-icon" id="activity-refresh">${icon('refresh-cw', { size: 14 })} Refresh</button>
+      </div>
+      <div class="activity-list">${rows}</div>
+    `,
+  );
+  panel.classList.add('activity-panel');
+  panel.querySelector('#activity-refresh')?.addEventListener('click', async () => {
+    await refreshView();
+    openActivityDrawer();
+  });
+  panel.querySelectorAll('.activity-row[data-task-id]').forEach((row) => {
+    row.addEventListener('click', () => {
+      const id = row.dataset.taskId;
+      closeModal();
+      if (!String(id).startsWith('pending_')) goto('detail', { detailId: id });
+    });
+  });
+}
+
+function variantByIndex(task, idx) {
+  return (task.variants ?? [])[idx] ?? null;
+}
+
+function downloadVariant(task, idx) {
+  const variant = variantByIndex(task, idx);
+  if (!variant) return toast('No image to download', 'err');
+  const a = document.createElement('a');
+  a.href = `/images/${variant.image_path}`;
+  a.download = `${task.id}-${idx}.png`;
+  a.click();
+}
+
+async function remixVariant(task, idx) {
+  const variant = variantByIndex(task, idx);
+  if (!variant) return toast('No variant available to remix', 'err');
+  try {
+    const resp = await fetch(`/images/${variant.image_path}`);
+    if (!resp.ok) throw new Error('Could not load source image');
+    const blob = await resp.blob();
+    const file = new File([blob], `variant-${idx + 1}.png`, { type: blob.type || 'image/png' });
+    const up = await uploadFile(file);
+    applyTaskToComposer(task, { prompt: '', referencePath: up.path });
+    closeModal();
+    await goto('media');
+    $('#prompt-input').focus();
+    toast(`Variant ${idx + 1} attached as remix reference`);
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+function markBestVariant(task, idx, { refresh = true } = {}) {
+  state.bestVariants[task.id] = idx;
+  localStorage.setItem(BEST_VARIANTS_KEY, JSON.stringify(state.bestVariants));
+  toast(`Marked variant ${idx + 1} as best`);
+  if (refresh) refreshView();
+}
+
+function openLightbox(task, startIdx = 0) {
+  let idx = Math.max(0, Math.min(startIdx, (task.variants ?? []).length - 1));
+  const render = () => {
+    const variant = variantByIndex(task, idx);
+    const bestIdx = state.bestVariants[task.id];
+    const panel = modal(
+      `Variant ${idx + 1} of ${task.variants?.length || 1}`,
+      `
+        <div class="lightbox-layout">
+          <div class="lightbox-stage">
+            ${variant ? `<img src="/images/${variant.image_path}" alt="variant ${idx + 1}" />` : '<div class="empty-state">No image</div>'}
+            ${(task.variants ?? []).length > 1
+              ? `<button class="lightbox-nav prev" type="button" title="Previous">${icon('arrow-left', { size: 18 })}</button>
+                 <button class="lightbox-nav next" type="button" title="Next">${icon('arrow-right', { size: 18 })}</button>`
+              : ''}
+          </div>
+          <aside class="lightbox-side">
+            <div class="lightbox-actions">
+              <button class="btn btn-with-icon" id="lightbox-remix">${icon('circle-dot', { size: 14 })} Remix this</button>
+              <button class="btn-ghost btn btn-with-icon" id="lightbox-download">${icon('download', { size: 14 })} Download</button>
+              <button class="btn-ghost btn btn-with-icon ${bestIdx === idx ? 'active' : ''}" id="lightbox-best">${icon('star', { size: 14 })} ${bestIdx === idx ? 'Best' : 'Mark best'}</button>
+              <button class="btn-ghost btn btn-with-icon" id="lightbox-copy">${icon('copy', { size: 14 })} Copy prompt</button>
+            </div>
+            <div class="task-preset-stack">${(task.presets ?? [])
+              .map((p) => `<span class="task-preset-tag ${p.type}">${p.type === 'style' ? '✦' : '❈'} ${escapeHtml(p.name)} v${p.version}</span>`)
+              .join('')}</div>
+            <div>
+              <div class="input-label">User prompt</div>
+              <div class="lightbox-prompt">${escapeHtml(task.prompt)}</div>
+            </div>
+            <div>
+              <div class="input-label">Composed prompt</div>
+              <div class="lightbox-prompt">${escapeHtml(taskRecipe(task) || 'Not captured for this generation.')}</div>
+            </div>
+          </aside>
+        </div>
+        ${(task.variants ?? []).length > 1
+          ? `<div class="lightbox-rail">${task.variants
+              .map((v, i) => `<button type="button" class="${i === idx ? 'active' : ''} ${bestIdx === i ? 'best' : ''}" data-lightbox-idx="${i}"><img src="/images/${v.image_path}" alt="variant ${i + 1}" /><span>${i + 1}</span></button>`)
+              .join('')}</div>`
+          : ''}
+      `,
+    );
+    panel.classList.add('lightbox-panel');
+    panel.querySelector('#lightbox-remix')?.addEventListener('click', () => remixVariant(task, idx));
+    panel.querySelector('#lightbox-download')?.addEventListener('click', () => downloadVariant(task, idx));
+    panel.querySelector('#lightbox-best')?.addEventListener('click', () => {
+      markBestVariant(task, idx, { refresh: false });
+      render();
+      refreshView();
+    });
+    panel.querySelector('#lightbox-copy')?.addEventListener('click', () => copyText(taskRecipe(task) || task.prompt, 'Prompt copied'));
+    panel.querySelector('.lightbox-nav.prev')?.addEventListener('click', () => {
+      idx = (idx - 1 + task.variants.length) % task.variants.length;
+      render();
+    });
+    panel.querySelector('.lightbox-nav.next')?.addEventListener('click', () => {
+      idx = (idx + 1) % task.variants.length;
+      render();
+    });
+    panel.querySelectorAll('[data-lightbox-idx]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        idx = Number(btn.dataset.lightboxIdx);
+        render();
+      });
+    });
+  };
+  render();
+}
+
 function taskCardHtml(task) {
   const count = task.variants?.length || task.variant_count || 1;
   const pending = task.status === 'pending';
   const failed = task.status === 'failed';
+  const selected = state.selectedTaskIds.has(task.id);
   const variantsHtml = pending
     ? `<div class="task-pending-content">
         <div class="task-pending-spinner"></div>
@@ -250,7 +875,12 @@ function taskCardHtml(task) {
   const kindLabel = (task.kind || 'image_generation').replace('_', ' ');
 
   return `
-    <div class="task-card ${pending ? 'pending' : ''} ${failed ? 'failed' : ''}" data-task-id="${task.id}">
+    <div class="task-card ${pending ? 'pending' : ''} ${failed ? 'failed' : ''} ${selected ? 'selected' : ''}" data-task-id="${task.id}">
+      ${Number.isInteger(state.bestVariants[task.id]) ? '<span class="task-best-badge">Best picked</span>' : ''}
+      <div class="task-card-tools">
+        <button class="task-select ${selected ? 'active' : ''}" data-action="select" title="Select">${icon(selected ? 'check-square' : 'square', { size: 14 })}</button>
+        <button class="task-menu" data-action="menu" title="More actions">${icon('more-horizontal', { size: 15 })}</button>
+      </div>
       <div class="task-variants" data-count="${count}" data-aspect="${task.aspect_ratio || '1:1'}">${variantsHtml}</div>
       <div class="task-meta">
         <div class="task-label">${kindLabel}</div>
@@ -271,6 +901,7 @@ function taskCardHtml(task) {
 
 function renderGallery() {
   const root = $('#view-root');
+  const tasks = filteredTasks();
   if (state.tasks.length === 0) {
     const emptyByView = {
       media: { icon: 'images', title: 'Nothing here yet', hint: 'Describe an image in the bar below to begin. Attach a character preset to anchor identity.' },
@@ -286,7 +917,15 @@ function renderGallery() {
     </div>`;
     return;
   }
-  const groups = groupTasksByDate(state.tasks);
+  if (tasks.length === 0) {
+    root.innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon">${icon('search', { size: 48 })}</div>
+      <div class="empty-state-title">No matches</div>
+      <div class="empty-state-hint">Try a prompt fragment, preset name, date, aspect ratio, or quality.</div>
+    </div>`;
+    return;
+  }
+  const groups = groupTasksByDate(tasks);
   const html = [...groups.entries()]
     .map(
       ([key, tasks]) => `
@@ -297,6 +936,7 @@ function renderGallery() {
     )
     .join('');
   root.innerHTML = html;
+  updateSelectionBar();
 
   // Delegate events for task actions
   root.onclick = async (ev) => {
@@ -306,23 +946,29 @@ function renderGallery() {
       const card = btn.closest('.task-card');
       const taskId = card.dataset.taskId;
       const action = btn.dataset.action;
+      const task = taskById(taskId);
       try {
-        if (action === 'favorite') {
-          const task = state.tasks.find((t) => t.id === taskId);
+        if (action === 'select') {
+          state.selectMode = true;
+          toggleTaskSelection(taskId);
+        } else if (action === 'menu') {
+          if (task) openTaskMenu(btn, task);
+        } else if (action === 'favorite') {
           await api(`/api/tasks/${taskId}`, { method: 'PATCH', body: { favorite: !task.favorite } });
           await refreshView();
         } else if (action === 'trash') {
-          await api(`/api/tasks/${taskId}`, { method: 'PATCH', body: { trashed: true } });
-          toast('Moved to trash');
-          await refreshView();
+          await setTasksTrashed([taskId], true);
         } else if (action === 'restore') {
-          await api(`/api/tasks/${taskId}`, { method: 'PATCH', body: { trashed: false } });
-          toast('Restored');
-          await refreshView();
+          await setTasksTrashed([taskId], false);
         }
       } catch (e) {
         toast(e.message, 'err');
       }
+      return;
+    }
+    const card = ev.target.closest('.task-card');
+    if (state.selectMode && card) {
+      toggleTaskSelection(card.dataset.taskId);
       return;
     }
     const img = ev.target.closest('img[data-variant-id]');
@@ -337,9 +983,6 @@ async function renderPresets() {
   await loadPresets();
   const root = $('#view-root');
 
-  // Preserve selected id across re-renders
-  const selectedId = root.dataset.selectedId || state.presets[0]?.id || '';
-
   root.innerHTML = `
     <div class="presets-layout">
       <div>
@@ -347,39 +990,92 @@ async function renderPresets() {
           <span class="input-label">All Presets</span>
           <button id="new-preset-btn">+ New</button>
         </div>
+        <div class="preset-tools">
+          <label class="preset-search">
+            ${icon('search', { size: 14 })}
+            <input id="preset-search-input" type="search" value="${escapeHtml(state.presetSearch)}" placeholder="Search presets..." autocomplete="off" />
+          </label>
+          <div class="preset-filter" role="tablist" aria-label="Preset type filter">
+            <button type="button" data-preset-filter="all" class="${state.presetTypeFilter === 'all' ? 'active' : ''}">All</button>
+            <button type="button" data-preset-filter="character" class="${state.presetTypeFilter === 'character' ? 'active' : ''}">Characters</button>
+            <button type="button" data-preset-filter="style" class="${state.presetTypeFilter === 'style' ? 'active' : ''}">Styles</button>
+          </div>
+        </div>
         <div class="presets-list" id="presets-list"></div>
       </div>
       <div id="preset-detail-root"></div>
     </div>`;
 
   const listRoot = $('#presets-list');
-  for (const p of state.presets) {
-    const el = document.createElement('div');
-    el.className = 'preset-item' + (p.id === selectedId ? ' active' : '');
-    el.dataset.presetId = p.id;
-    el.innerHTML = `
-      <div>
-        <span class="preset-item-name">${escapeHtml(p.name)}</span>
-        <span class="preset-item-version">v${p.version}</span>
-      </div>
-      <span class="preset-item-count">${String(p.use_count).padStart(4, '0')}</span>`;
-    el.onclick = () => selectPreset(p.id);
-    listRoot.appendChild(el);
-  }
+  const detailRoot = $('#preset-detail-root');
 
-  if (state.presets.length === 0) {
-    listRoot.innerHTML = `<div class="empty-state" style="padding: 30px 10px;">No presets yet. Create one to lock in your style.</div>`;
-  }
+  const visiblePresets = () => {
+    const term = state.presetSearch.trim().toLowerCase();
+    return state.presets.filter((p) => {
+      if (state.presetTypeFilter !== 'all' && p.type !== state.presetTypeFilter) return false;
+      if (!term) return true;
+      return `${p.name} ${p.body} ${p.type}`.toLowerCase().includes(term);
+    });
+  };
+
+  const paintList = () => {
+    const visible = visiblePresets();
+    let selectedId = root.dataset.selectedId || visible[0]?.id || '';
+    if (!visible.some((p) => p.id === selectedId)) selectedId = visible[0]?.id || '';
+    root.dataset.selectedId = selectedId;
+
+    listRoot.innerHTML = '';
+    for (const p of visible) {
+      const el = document.createElement('div');
+      el.className = 'preset-item' + (p.id === selectedId ? ' active' : '');
+      el.dataset.presetId = p.id;
+      el.innerHTML = `
+        <div>
+          <span class="preset-item-name">${escapeHtml(p.name)}</span>
+          <span class="preset-item-version">v${p.version}</span>
+          <span class="preset-item-type ${p.type}">${p.type}</span>
+        </div>
+        <span class="preset-item-count">${String(p.use_count).padStart(4, '0')}</span>`;
+      el.onclick = () => selectPreset(p.id);
+      listRoot.appendChild(el);
+    }
+
+    if (state.presets.length === 0) {
+      listRoot.innerHTML = `<div class="empty-state preset-list-empty">No presets yet. Create one to lock in your style.</div>`;
+    } else if (visible.length === 0) {
+      listRoot.innerHTML = `<div class="empty-state preset-list-empty">No presets match that filter.</div>`;
+    }
+
+    if (selectedId) {
+      renderPresetDetail(selectedId, false);
+    } else if (state.presets.length === 0) {
+      renderPresetDetail(null, true);
+    } else {
+      detailRoot.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon">${icon('search', { size: 48 })}</div>
+          <div class="empty-state-title">No preset selected</div>
+          <div class="empty-state-hint">Clear the search or switch filters to choose a preset.</div>
+        </div>`;
+    }
+  };
 
   $('#new-preset-btn').onclick = () => renderPresetDetail(null, true);
+  $('#preset-search-input').addEventListener('input', (ev) => {
+    state.presetSearch = ev.currentTarget.value;
+    paintList();
+  });
+  $$('.preset-filter button').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.presetTypeFilter = btn.dataset.presetFilter;
+      $$('.preset-filter button').forEach((el) =>
+        el.classList.toggle('active', el.dataset.presetFilter === state.presetTypeFilter),
+      );
+      paintList();
+    });
+  });
 
-  if (selectedId && state.presets.find((p) => p.id === selectedId)) {
-    renderPresetDetail(selectedId, false);
-  } else if (state.presets.length === 0) {
-    renderPresetDetail(null, true);
-  }
-
-  root.dataset.selectedId = selectedId;
+  paintList();
 }
 
 function selectPreset(id) {
@@ -641,7 +1337,84 @@ async function pollPending() {
 }
 
 // ---- Workshop ----
-const SKETCHPAD_KEY = 'easel:sketchpad';
+function loadDrafts() {
+  return loadJson(DRAFTS_KEY, []).filter((draft) => draft?.id && draft?.prompt);
+}
+
+function persistDrafts(drafts) {
+  localStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts.slice(0, 24)));
+}
+
+function savePromptDraft(prompt, title = 'Prompt draft', source = 'Workshop') {
+  const cleanPrompt = String(prompt ?? '').trim();
+  if (!cleanPrompt) return toast('No prompt to save', 'err');
+  const draft = {
+    id: `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    title,
+    source,
+    prompt: cleanPrompt,
+    created_at: Date.now(),
+  };
+  persistDrafts([draft, ...loadDrafts()]);
+  renderDraftList();
+  toast('Draft saved');
+}
+
+function draftCardHtml(draft) {
+  const created = new Date(draft.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return `
+    <div class="workshop-draft" data-draft-id="${escapeHtml(draft.id)}">
+      <div class="workshop-draft-top">
+        <div>
+          <span class="workshop-draft-title">${escapeHtml(draft.title || 'Prompt draft')}</span>
+          <span class="workshop-draft-meta">${escapeHtml(draft.source || 'Workshop')} · ${created}</span>
+        </div>
+        <button type="button" class="btn-ghost btn" data-draft-action="delete" title="Delete draft">${icon('trash', { size: 13 })}</button>
+      </div>
+      <div class="workshop-draft-body">${escapeHtml(draft.prompt)}</div>
+      <div class="workshop-draft-actions">
+        <button type="button" class="btn btn-with-icon" data-draft-action="send">${icon('arrow-up', { size: 14 })} Send to bar</button>
+        <button type="button" class="btn-ghost btn btn-with-icon" data-draft-action="copy">${icon('copy', { size: 14 })} Copy</button>
+      </div>
+    </div>`;
+}
+
+function renderDraftList() {
+  const root = $('#ws-drafts-list');
+  if (!root) return;
+  const drafts = loadDrafts();
+  root.innerHTML = drafts.length
+    ? drafts.map(draftCardHtml).join('')
+    : `<div class="workshop-drafts-empty">Saved workshop prompts will wait here until you are ready to generate.</div>`;
+  const count = $('#ws-draft-count');
+  if (count) count.textContent = drafts.length === 1 ? '1 draft' : `${drafts.length} drafts`;
+}
+
+function wireDraftActions() {
+  $('#ws-drafts-list')?.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('button[data-draft-action]');
+    if (!btn) return;
+    const card = btn.closest('[data-draft-id]');
+    const draft = loadDrafts().find((item) => item.id === card?.dataset.draftId);
+    if (!draft) return;
+
+    if (btn.dataset.draftAction === 'send') {
+      sendPromptToBar(draft.prompt);
+    } else if (btn.dataset.draftAction === 'copy') {
+      await copyText(draft.prompt, 'Draft copied');
+    } else if (btn.dataset.draftAction === 'delete') {
+      persistDrafts(loadDrafts().filter((item) => item.id !== draft.id));
+      renderDraftList();
+      toast('Draft deleted', {
+        label: 'Undo',
+        onClick: () => {
+          persistDrafts([draft, ...loadDrafts()]);
+          renderDraftList();
+        },
+      });
+    }
+  });
+}
 
 function renderWorkshop() {
   const root = $('#view-root');
@@ -673,6 +1446,7 @@ function renderWorkshop() {
           <div class="workshop-actions">
             <button class="btn-ghost btn" id="ws-image-analyze" disabled>${icon('sparkles', { size: 14 })} <span>Analyze</span></button>
             <button class="btn btn-with-icon" id="ws-image-send" disabled>${icon('arrow-up', { size: 14 })} Send to bar</button>
+            <button class="btn-ghost btn btn-with-icon" id="ws-image-draft" disabled>${icon('archive', { size: 14 })} Save draft</button>
           </div>
         </div>
 
@@ -696,6 +1470,21 @@ function renderWorkshop() {
         </div>
       </div>
 
+      <!-- Prompt Drafts -->
+      <div class="workshop-drafts">
+        <div class="workshop-drafts-header">
+          <div class="workshop-card-header" style="padding: 0; border-bottom: none;">
+            <div class="workshop-card-icon">${icon('archive', { size: 18 })}</div>
+            <div class="workshop-card-titles">
+              <span class="workshop-card-title">Prompt Drafts</span>
+              <span class="workshop-card-hint">Save ideas from the workshop and send them back into the composer later.</span>
+            </div>
+          </div>
+          <span id="ws-draft-count">0 drafts</span>
+        </div>
+        <div class="workshop-drafts-list" id="ws-drafts-list"></div>
+      </div>
+
       <!-- Sketchpad -->
       <div class="workshop-sketchpad">
         <div class="workshop-card-header" style="padding-bottom: 8px;">
@@ -714,6 +1503,7 @@ function renderWorkshop() {
     </div>`;
 
   wireWorkshop();
+  renderDraftList();
 }
 
 function wireWorkshop() {
@@ -724,6 +1514,7 @@ function wireWorkshop() {
   const output = $('#ws-image-output');
   const analyzeBtn = $('#ws-image-analyze');
   const sendBtn = $('#ws-image-send');
+  const draftBtn = $('#ws-image-draft');
   let selectedFile = null;
   let generatedPrompt = '';
 
@@ -766,6 +1557,7 @@ function wireWorkshop() {
     output.textContent = 'ready to analyze';
     generatedPrompt = '';
     sendBtn.disabled = true;
+    draftBtn.disabled = true;
   }
 
   analyzeBtn.onclick = async () => {
@@ -788,6 +1580,7 @@ function wireWorkshop() {
       output.className = 'workshop-output';
       output.textContent = generatedPrompt;
       sendBtn.disabled = !generatedPrompt;
+      draftBtn.disabled = !generatedPrompt;
     } catch (e) {
       output.className = 'workshop-output empty';
       output.textContent = 'failed';
@@ -802,6 +1595,7 @@ function wireWorkshop() {
     if (!generatedPrompt) return;
     sendPromptToBar(generatedPrompt);
   };
+  draftBtn.onclick = () => savePromptDraft(generatedPrompt, selectedFile?.name || 'Image prompt', 'From image');
 
   // --- Brain dump ---
   const dumpInput = $('#ws-dump');
@@ -833,6 +1627,7 @@ function wireWorkshop() {
             <div class="workshop-brainstorm-option-actions">
               <button class="btn btn-with-icon" data-action="send-option" data-idx="${i}">${icon('arrow-up', { size: 14 })} Send to bar</button>
               <button class="btn-ghost btn btn-with-icon" data-action="copy-option" data-idx="${i}">${icon('copy', { size: 14 })} Copy</button>
+              <button class="btn-ghost btn btn-with-icon" data-action="save-option" data-idx="${i}">${icon('archive', { size: 14 })} Save draft</button>
             </div>
           </div>`,
           )
@@ -851,6 +1646,8 @@ function wireWorkshop() {
               } catch (e) {
                 toast(e.message, 'err');
               }
+            } else if (btn.dataset.action === 'save-option') {
+              savePromptDraft(opt.prompt, opt.title || `Option ${idx + 1}`, 'Brain dump');
             }
           });
         });
@@ -876,6 +1673,8 @@ function wireWorkshop() {
       sketchpadStatus.textContent = 'saved';
     }, 400);
   });
+
+  wireDraftActions();
 }
 
 function sendPromptToBar(promptText) {
@@ -937,8 +1736,10 @@ async function renderDetail(taskId) {
           ${new Date(task.created_at).toLocaleString()} · ${task.aspect_ratio} · ${task.quality}
         </div>
         <div class="detail-toolbar-actions">
-          <button class="btn btn-with-icon" id="reuse-prompt" title="Load prompt and settings into the bar">${icon('refresh-cw', { size: 14 })} Reuse</button>
+          <button class="btn-ghost btn btn-with-icon ${task.favorite ? 'active' : ''}" id="favorite-detail" title="Favorite">${icon(task.favorite ? 'star-filled' : 'star', { size: 14 })} Favorite</button>
+          <button class="btn btn-with-icon" id="reuse-prompt" title="Load prompt and settings into the bar">${icon('refresh-cw', { size: 14 })} Edit prompt</button>
           ${task.variants?.length ? `<button class="btn-ghost btn btn-with-icon" id="remix-btn" title="Use first variant as reference for a new gen">${icon('circle-dot', { size: 14 })} Remix</button>` : ''}
+          <button class="btn-ghost btn btn-with-icon" id="move-detail" title="Move to folder">${icon('folder', { size: 14 })} Move</button>
           ${task.variants?.length ? `<button class="btn-ghost btn btn-with-icon" id="download-first" title="Download first variant">${icon('download', { size: 14 })} Download</button>` : ''}
         </div>
       </div>
@@ -947,76 +1748,75 @@ async function renderDetail(taskId) {
           .map(
             (v, idx) => `
             <div class="detail-variant-wrap" style="position: relative;">
-              <img src="/images/${v.image_path}" alt="variant ${v.idx}" data-variant-path="${v.image_path}" />
-              <a class="detail-copy-btn" href="/images/${v.image_path}" download="${task.id}-${idx}.png" title="Download variant ${idx + 1}">${icon('download', { size: 14 })}</a>
+              <img src="/images/${v.image_path}" alt="variant ${v.idx}" data-variant-idx="${idx}" data-variant-path="${v.image_path}" />
+              ${state.bestVariants[task.id] === idx ? '<span class="variant-best-badge">Best</span>' : ''}
+              <div class="variant-actions">
+                <button type="button" data-variant-action="inspect" data-variant-idx="${idx}" title="Inspect">${icon('eye', { size: 14 })}</button>
+                <button type="button" data-variant-action="remix" data-variant-idx="${idx}" title="Remix this">${icon('circle-dot', { size: 14 })}</button>
+                <button type="button" data-variant-action="best" data-variant-idx="${idx}" title="Mark best">${icon('star', { size: 14 })}</button>
+                <a href="/images/${v.image_path}" download="${task.id}-${idx}.png" title="Download variant ${idx + 1}">${icon('download', { size: 14 })}</a>
+              </div>
             </div>`,
           )
           .join('')}
       </div>
+      ${(task.variants || []).length > 1
+        ? `<div class="detail-variant-rail">${task.variants
+            .map(
+              (v, idx) =>
+                `<button type="button" class="${state.bestVariants[task.id] === idx ? 'best' : ''}" data-scroll-variant="${idx}"><img src="/images/${v.image_path}" alt="variant ${idx + 1}" /><span>${idx + 1}</span></button>`,
+            )
+            .join('')}</div>`
+        : ''}
       ${presetBlock}
       ${refBlock}
       <div class="detail-copy-wrap">
+        <div class="input-label">User prompt</div>
         <div class="detail-prompt-block">${escapeHtml(task.prompt)}</div>
         <button class="detail-copy-btn" id="copy-prompt" title="Copy prompt to clipboard">${icon('copy', { size: 14 })}</button>
+      </div>
+      <div class="detail-copy-wrap">
+        <div class="input-label">Composed prompt</div>
+        <div class="detail-prompt-block">${escapeHtml(taskRecipe(task) || 'Not captured for this generation.')}</div>
+        <button class="detail-copy-btn" id="copy-composed-detail" title="Copy composed prompt">${icon('copy', { size: 14 })}</button>
       </div>
     </div>`;
 
   $('#back-btn').onclick = () => history.back();
-  $('#reuse-prompt').onclick = () => {
-    $('#prompt-input').value = task.prompt;
-    state.settings.aspect = task.aspect_ratio;
-    state.settings.variants = task.variant_count;
-    state.settings.quality = task.quality;
-    state.settings.characterIds = characterPresetsInTask.map((p) => p.id);
-    state.settings.styleId = stylePresetInTask?.id ?? '';
-    state.settings.referencePath = task.reference_image_path;
-    syncChips();
-    renderRefStrip();
-    goto('media');
-    $('#prompt-input').focus();
-  };
+  $('#reuse-prompt').onclick = () => reuseTask(task);
+  $('#favorite-detail')?.addEventListener('click', async () => {
+    await api(`/api/tasks/${task.id}`, { method: 'PATCH', body: { favorite: !task.favorite } });
+    toast(task.favorite ? 'Removed from favorites' : 'Favorited');
+    await refreshView();
+  });
+  $('#move-detail')?.addEventListener('click', (ev) => openMoveMenu(ev.currentTarget, [task.id]));
 
   $('#copy-prompt')?.addEventListener('click', async () => {
-    try {
-      await navigator.clipboard.writeText(task.prompt);
-      toast('Prompt copied');
-    } catch (e) {
-      toast('Copy failed: ' + e.message, 'err');
-    }
+    await copyText(task.prompt, 'Prompt copied');
   });
+  $('#copy-composed-detail')?.addEventListener('click', () => copyText(taskRecipe(task) || task.prompt, 'Composed prompt copied'));
 
-  $('#download-first')?.addEventListener('click', () => {
-    const v = task.variants?.[0];
-    if (!v) return;
-    const a = document.createElement('a');
-    a.href = `/images/${v.image_path}`;
-    a.download = `${task.id}-0.png`;
-    a.click();
+  $('#download-first')?.addEventListener('click', () => downloadFirstVariant(task));
+
+  $('#remix-btn')?.addEventListener('click', () => remixTask(task));
+  $$('.detail-variants img[data-variant-idx]').forEach((img) => {
+    img.addEventListener('click', () => openLightbox(task, Number(img.dataset.variantIdx)));
   });
-
-  $('#remix-btn')?.addEventListener('click', async () => {
-    try {
-      const first = task.variants[0];
-      const resp = await fetch(`/images/${first.image_path}`);
-      if (!resp.ok) throw new Error('Could not load source image');
-      const blob = await resp.blob();
-      const file = new File([blob], 'remix.png', { type: blob.type || 'image/png' });
-      const up = await uploadFile(file);
-      state.settings.referencePath = up.path;
-      state.settings.aspect = task.aspect_ratio;
-      state.settings.variants = task.variant_count;
-      state.settings.quality = task.quality;
-      state.settings.characterIds = characterPresetsInTask.map((p) => p.id);
-      state.settings.styleId = stylePresetInTask?.id ?? '';
-      $('#prompt-input').value = '';
-      renderRefStrip();
-      syncChips();
-      toast('Remix reference attached — describe the change and hit send');
-      await goto('media');
-      $('#prompt-input').focus();
-    } catch (e) {
-      toast(e.message, 'err');
-    }
+  $$('.variant-actions [data-variant-action]').forEach((btn) => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const idx = Number(btn.dataset.variantIdx);
+      const action = btn.dataset.variantAction;
+      if (action === 'inspect') openLightbox(task, idx);
+      else if (action === 'remix') remixVariant(task, idx);
+      else if (action === 'best') markBestVariant(task, idx);
+    });
+  });
+  $$('.detail-variant-rail button').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const idx = Number(btn.dataset.scrollVariant);
+      $$('.detail-variant-wrap')[idx]?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    });
   });
 }
 
@@ -1040,12 +1840,30 @@ function setViewTitle() {
     detail: 'Detail',
   };
   $('#view-title').textContent = titles[state.view] || 'Easel';
-  const counts = { media: state.tasks.length, favorites: state.tasks.length, trash: state.tasks.length };
-  const c = counts[state.view];
-  $('#view-meta').textContent = typeof c === 'number' ? `${c} ${c === 1 ? 'generation' : 'generations'}` : '';
+  const galleryView = isGalleryView();
+  const tools = $('#gallery-tools');
+  tools.hidden = !galleryView;
+  if (!galleryView) {
+    state.selectMode = false;
+    state.selectedTaskIds.clear();
+  }
+  updateSelectionBar();
+  if (galleryView) {
+    const filteredCount = filteredTasks().length;
+    const totalCount = state.tasks.length;
+    const suffix = filteredCount === 1 ? 'generation' : 'generations';
+    $('#view-meta').textContent =
+      state.search.trim() && filteredCount !== totalCount
+        ? `${filteredCount} of ${totalCount} ${suffix}`
+        : `${totalCount} ${totalCount === 1 ? 'generation' : 'generations'}`;
+  } else {
+    $('#view-meta').textContent = '';
+  }
 }
 
 async function goto(view, opts = {}) {
+  closePopover();
+  closeModal();
   state.view = view;
   state.folderId = opts.folderId ?? null;
   state.detailId = opts.detailId ?? null;
@@ -1090,6 +1908,7 @@ function syncChips() {
   const style = stylePresets().find((p) => p.id === state.settings.styleId);
   $('#chip-style .chip-value').textContent = style ? `${style.name} v${style.version}` : 'No style';
   $('#chip-style').classList.toggle('has-value', !!style);
+  saveSettings();
 }
 
 function wireChips() {
@@ -1193,24 +2012,55 @@ function renderRefStrip() {
   strip.appendChild(thumb);
 }
 
+async function attachReferenceFile(file) {
+  if (!file?.type?.startsWith('image/')) {
+    toast('Drop an image file to attach a reference', 'err');
+    return;
+  }
+  const up = await uploadFile(file);
+  state.settings.referencePath = up.path;
+  renderRefStrip();
+  toast('Reference attached');
+}
+
 function wireAttach() {
   const btn = $('#attach-btn');
   const input = $('#attach-input');
+  const form = $('#prompt-form');
   btn.onclick = () => input.click();
   input.onchange = async () => {
     const file = input.files?.[0];
     if (!file) return;
     try {
-      const up = await uploadFile(file);
-      state.settings.referencePath = up.path;
-      renderRefStrip();
-      toast('Reference attached');
+      await attachReferenceFile(file);
     } catch (e) {
       toast(e.message, 'err');
     } finally {
       input.value = ''; // reset so same file can be re-picked
     }
   };
+  ['dragenter', 'dragover'].forEach((evt) => {
+    form.addEventListener(evt, (e) => {
+      if (![...e.dataTransfer?.items ?? []].some((item) => item.type.startsWith('image/'))) return;
+      e.preventDefault();
+      form.classList.add('dragover');
+    });
+  });
+  ['dragleave', 'drop'].forEach((evt) => {
+    form.addEventListener(evt, (e) => {
+      e.preventDefault();
+      form.classList.remove('dragover');
+    });
+  });
+  form.addEventListener('drop', async (e) => {
+    const file = e.dataTransfer?.files?.[0];
+    if (!file) return;
+    try {
+      await attachReferenceFile(file);
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  });
 }
 
 // ---- Generate ----
@@ -1232,6 +2082,7 @@ async function handleGenerate(ev) {
   const submittedVariants = state.settings.variants;
   const submittedQuality = state.settings.quality;
   const submittedFolderId = state.view === 'folder' ? state.folderId : null;
+  const submittedComposedPrompt = composedPrompt(submittedPrompt);
 
   // Build the preset stack we'll render optimistically
   const optimisticPresets = [];
@@ -1251,6 +2102,7 @@ async function handleGenerate(ev) {
     id: pendingId,
     kind: 'image_generation',
     prompt: submittedPrompt,
+    composed_prompt: submittedComposedPrompt,
     preset_id: null,
     parent_task_id: null,
     aspect_ratio: submittedAspect,
@@ -1329,6 +2181,15 @@ function autoResizePrompt() {
 }
 
 // ---- Util ----
+function loadJson(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -1343,16 +2204,7 @@ async function boot() {
     };
   });
 
-  $('#new-folder-btn').onclick = async () => {
-    const name = prompt('Folder name?'); // native prompt, simple
-    if (!name) return;
-    try {
-      await api('/api/folders', { method: 'POST', body: { name } });
-      await loadFolders();
-    } catch (e) {
-      toast(e.message, 'err');
-    }
-  };
+  $('#new-folder-btn').onclick = () => openNewFolderDialog();
 
   $('#prompt-form').addEventListener('submit', handleGenerate);
 
@@ -1369,15 +2221,71 @@ async function boot() {
   wireChips();
   wireAttach();
   wireKeyboard();
+  wireGalleryTools();
+  wireSelectionBar();
+  $('#activity-btn').onclick = openActivityDrawer;
+  $('#chip-review').onclick = openPromptReview;
 
   window.addEventListener('popstate', () => routeFromHash());
 
   await Promise.all([loadFolders(), loadPresets()]);
+  loadSettings();
   syncChips();
   renderRefStrip();
   hydrateIcons();
 
   routeFromHash();
+}
+
+function wireGalleryTools() {
+  const input = $('#gallery-search-input');
+  const clear = $('#gallery-search-clear');
+  $('#select-mode-btn').addEventListener('click', () => setSelectMode(!state.selectMode));
+  input.addEventListener('input', () => {
+    state.search = input.value;
+    clear.hidden = !state.search;
+    if (['media', 'favorites', 'trash', 'folder'].includes(state.view)) {
+      renderGallery();
+      setViewTitle();
+    }
+  });
+  clear.addEventListener('click', () => {
+    state.search = '';
+    input.value = '';
+    clear.hidden = true;
+    renderGallery();
+    setViewTitle();
+    input.focus();
+  });
+}
+
+function wireSelectionBar() {
+  $('#selection-bar').addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('button[data-batch-action]');
+    if (!btn) return;
+    const ids = selectedIds();
+    const action = btn.dataset.batchAction;
+    if (action === 'clear') {
+      return setSelectMode(false);
+    }
+    if (ids.length === 0) return toast('Select at least one generation', 'err');
+    try {
+      if (action === 'favorite') {
+        await Promise.all(ids.map((id) => api(`/api/tasks/${id}`, { method: 'PATCH', body: { favorite: true } })));
+        toast(ids.length === 1 ? 'Favorited' : `Favorited ${ids.length}`);
+        setSelectMode(false);
+        await refreshView();
+      } else if (action === 'trash') {
+        await setTasksTrashed(ids, true);
+      } else if (action === 'move') {
+        openMoveMenu(btn, ids);
+      } else if (action === 'export') {
+        await exportTasks(ids);
+      }
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  });
 }
 
 function wireKeyboard() {
@@ -1387,6 +2295,10 @@ function wireKeyboard() {
 
     // Esc — close popover, or go back from detail/presets
     if (ev.key === 'Escape') {
+      if (document.getElementById('active-modal')) {
+        closeModal();
+        return;
+      }
       if (document.getElementById('active-popover')) {
         closePopover();
         return;

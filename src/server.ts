@@ -1,7 +1,7 @@
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono } from 'hono';
-import { createReadStream, mkdirSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toFile } from 'openai';
@@ -182,6 +182,88 @@ type TaskWithVariants = Task & {
   presets: PresetStackEntry[];
 };
 
+type ZipEntry = {
+  name: string;
+  data: Buffer;
+};
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(data: Buffer) {
+  let crc = 0xffffffff;
+  for (const byte of data) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function zipStore(entries: ZipEntry[]) {
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name.replace(/\\/g, '/'));
+    const data = entry.data;
+    const crc = crc32(data);
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4); // version needed
+    local.writeUInt16LE(0, 6); // flags
+    local.writeUInt16LE(0, 8); // store, no compression
+    local.writeUInt16LE(0, 10);
+    local.writeUInt16LE(0, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(0, 28);
+    localParts.push(local, name, data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4); // version made by
+    central.writeUInt16LE(20, 6); // version needed
+    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(0, 12);
+    central.writeUInt16LE(0, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(offset, 42);
+    centralParts.push(central, name);
+
+    offset += local.length + name.length + data.length;
+  }
+
+  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+
+  return Buffer.concat([...localParts, ...centralParts, end]);
+}
+
 function presetsForTask(taskId: string): PresetStackEntry[] {
   return db
     .prepare(
@@ -203,13 +285,76 @@ function taskWithVariants(taskId: string): TaskWithVariants | null {
   return { ...task, variants, presets: presetsForTask(taskId) };
 }
 
+app.post('/api/export', async (c) => {
+  const body = (await c.req.json()) as { task_ids?: string[] };
+  const taskIds = [...new Set(body.task_ids ?? [])].filter(Boolean).slice(0, 100);
+  if (taskIds.length === 0) return c.json({ error: 'task_ids required' }, 400);
+
+  const tasks = taskIds.map((id) => taskWithVariants(id)).filter((task): task is TaskWithVariants => !!task);
+  if (tasks.length === 0) return c.json({ error: 'no matching tasks' }, 404);
+
+  const metadata = tasks.map((task) => ({
+    id: task.id,
+    kind: task.kind,
+    prompt: task.prompt,
+    composed_prompt: task.composed_prompt ?? null,
+    created_at: new Date(task.created_at).toISOString(),
+    aspect_ratio: task.aspect_ratio,
+    variant_count: task.variant_count,
+    quality: task.quality,
+    favorite: !!task.favorite,
+    folder_id: task.folder_id,
+    reference_image_path: task.reference_image_path,
+    presets: task.presets,
+    variants: task.variants.map((variant) => ({
+      id: variant.id,
+      idx: variant.idx,
+      image_path: variant.image_path,
+      archive_path: `images/${task.id}/${variant.idx}${extname(variant.image_path) || '.png'}`,
+      width: variant.width,
+      height: variant.height,
+    })),
+  }));
+
+  const entries: ZipEntry[] = [
+    {
+      name: 'metadata.json',
+      data: Buffer.from(
+        JSON.stringify({ exported_at: new Date().toISOString(), app: 'easel-ai', tasks: metadata }, null, 2),
+      ),
+    },
+  ];
+
+  for (const task of tasks) {
+    for (const variant of task.variants) {
+      const imagePath = join(IMAGES_DIR, variant.image_path);
+      if (!existsSync(imagePath)) continue;
+      entries.push({
+        name: `images/${task.id}/${variant.idx}${extname(variant.image_path) || '.png'}`,
+        data: readFileSync(imagePath),
+      });
+    }
+  }
+
+  const zip = zipStore(entries);
+  const filename = `easel-ai-export-${new Date().toISOString().slice(0, 10)}.zip`;
+  return new Response(zip, {
+    status: 200,
+    headers: {
+      'content-type': 'application/zip',
+      'content-disposition': `attachment; filename="${filename}"`,
+    },
+  });
+});
+
 app.get('/api/tasks', (c) => {
-  const view = c.req.query('view') ?? 'media'; // media | favorites | trash | folder
+  const view = c.req.query('view') ?? 'media'; // media | favorites | trash | folder | all
   const folderId = c.req.query('folder_id') ?? null;
 
   let where = '';
   const args: unknown[] = [];
-  if (view === 'favorites') where = 'WHERE favorite = 1 AND trashed = 0';
+  if (view === 'all') where = '';
+  else if (view === 'favorites') where = 'WHERE favorite = 1 AND trashed = 0';
   else if (view === 'trash') where = 'WHERE trashed = 1';
   else if (view === 'folder' && folderId) {
     where = 'WHERE folder_id = ? AND trashed = 0';
@@ -353,11 +498,12 @@ app.post('/api/generate', async (c) => {
   const now = Date.now();
 
   db.prepare(
-    `INSERT INTO tasks (id, kind, prompt, preset_id, aspect_ratio, variant_count, quality, reference_image_path, folder_id, status, created_at)
-     VALUES (?, 'image_generation', ?, NULL, ?, ?, ?, ?, ?, 'pending', ?)`,
+    `INSERT INTO tasks (id, kind, prompt, composed_prompt, preset_id, aspect_ratio, variant_count, quality, reference_image_path, folder_id, status, created_at)
+     VALUES (?, 'image_generation', ?, ?, NULL, ?, ?, ?, ?, ?, 'pending', ?)`,
   ).run(
     taskId,
     body.prompt.trim(),
+    composedPrompt,
     body.aspect,
     n,
     body.quality,
